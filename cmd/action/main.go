@@ -45,6 +45,9 @@ func main() {
 		panic(validateErr)
 	}
 
+	// Set all missing required fields that can be inferred by other inputs
+	stackData = addMissingStackData(stackData)
+
 	// Construct the API request to declare the stack
 	req := containerclientv2.UpdateStackRequest{
 		Body:    *stackData,
@@ -103,6 +106,21 @@ func main() {
 
 		slog.With("service", svc.ServiceName).Info("✅ Service recreated successfully")
 	}
+}
+
+func addMissingStackData(stack *containerclientv2.UpdateStackRequestBody) *containerclientv2.UpdateStackRequestBody {
+	updated := *stack
+
+	// Assert that all volumes have a name set (required by the API)
+	for v, volume := range stack.Volumes {
+		volumeName := v
+		if volume.Name == nil || *volume.Name == "" {
+			volume.Name = &volumeName
+			updated.Volumes[volumeName] = volume
+		}
+	}
+
+	return &updated
 }
 
 // loadStackData determines whether a full stack definition or a services/volumes split was provided.

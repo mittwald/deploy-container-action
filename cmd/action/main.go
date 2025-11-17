@@ -189,7 +189,7 @@ func loadYamlOptional(name string) (map[string]interface{}, error) {
 	}
 
 	// Parse as Go template to allow environment variable substitution (e.g., {{ .Env.MY_VAR }})
-	configTemplate, createTplErr := template.New("").Parse(string(rawInput))
+	configTemplate, createTplErr := template.New("").Option("missingkey=error").Parse(string(rawInput))
 	if createTplErr != nil {
 		return nil, errors.Wrap(createTplErr, "failure while creating template from input")
 	}

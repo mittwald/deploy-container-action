@@ -64,7 +64,6 @@ jobs:
 services:
   mydb:
     image: "mysql:8.0"
-    description: "MySQL"
     ports:
       - "3306/tcp"
     envs:
@@ -112,10 +111,12 @@ with:
   services_yaml: |
     app:
       image: "nginx"
-      description: "Nginx"
       ports:
         - "80/tcp"
 ```
+
+> [!NOTE]
+> `description` is optional. If omitted, the action uses the service name as fallback when building the API request.
 
 ## ⚙️ Inputs
 

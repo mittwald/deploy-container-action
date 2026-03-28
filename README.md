@@ -64,6 +64,7 @@ jobs:
 services:
   mydb:
     image: "mysql:8.0"
+    description: "MySQL"
     ports:
       - "3306/tcp"
     envs:

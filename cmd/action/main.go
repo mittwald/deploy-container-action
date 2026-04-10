@@ -39,14 +39,14 @@ func main() {
 		panic(loadStackDataErr)
 	}
 
+	// Set all missing required fields that can be inferred by other inputs
+	stackData = addMissingStackData(stackData)
+
 	// Run type-level validation (SDK-based) on parsed stack config
 	if validateErr := stackData.Validate(); validateErr != nil {
 		slog.Error("❌ invalid stack data")
 		panic(validateErr)
 	}
-
-	// Set all missing required fields that can be inferred by other inputs
-	stackData = addMissingStackData(stackData)
 
 	// Construct the API request to declare the stack
 	req := containerclientv2.UpdateStackRequest{
@@ -111,11 +111,20 @@ func main() {
 func addMissingStackData(stack *containerclientv2.UpdateStackRequestBody) *containerclientv2.UpdateStackRequestBody {
 	updated := *stack
 
+	// Assert that all services have a description set (required by the API)
+	for serviceName, service := range stack.Services {
+		if service.Description == nil || *service.Description == "" {
+			serviceDescription := serviceName
+			service.Description = &serviceDescription
+			updated.Services[serviceName] = service
+		}
+	}
+
 	// Assert that all volumes have a name set (required by the API)
-	for v, volume := range stack.Volumes {
-		volumeName := v
+	for volumeName, volume := range stack.Volumes {
 		if volume.Name == nil || *volume.Name == "" {
-			volume.Name = &volumeName
+			name := volumeName
+			volume.Name = &name
 			updated.Volumes[volumeName] = volume
 		}
 	}

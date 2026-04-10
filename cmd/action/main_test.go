@@ -137,6 +137,8 @@ volumes:
 	s.NoError(err)
 	s.NotNil(stack)
 
+	stack = addMissingStackData(stack)
+
 	s.Contains(stack.Services, "app")
 	s.Equal("nginx", *stack.Services["app"].Image)
 	s.Equal("test app", *stack.Services["app"].Description)
@@ -172,6 +174,8 @@ data:
 	stack, err := loadStackData()
 	s.NoError(err)
 	s.NotNil(stack)
+
+	stack = addMissingStackData(stack)
 
 	s.Contains(stack.Services, "app")
 	s.Equal("nginx", *stack.Services["app"].Image)
@@ -215,6 +219,8 @@ volumes:
 	s.NoError(err)
 	s.NotNil(stack)
 
+	stack = addMissingStackData(stack)
+
 	s.Contains(stack.Services, "app")
 	s.Equal("nginx", *stack.Services["app"].Image)
 	s.Equal("test app", *stack.Services["app"].Description)
@@ -252,6 +258,8 @@ data:
 	s.NoError(err)
 	s.NotNil(stack)
 
+	stack = addMissingStackData(stack)
+
 	s.Contains(stack.Services, "app")
 	s.Equal("nginx", *stack.Services["app"].Image)
 	s.Equal("test app", *stack.Services["app"].Description)
@@ -277,6 +285,74 @@ func (s *StackActionTestSuite) TestLoadStackData_FromInvalidFile() {
 	s.Contains(err.Error(), "unmarshal")
 }
 
+func (s *StackActionTestSuite) TestLoadStackData_AllowsMissingServiceDescription() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: nginx
+    ports:
+      - "80/tcp"
+`,
+	)
+
+	stack, err := loadStackData()
+	s.NoError(err)
+	s.NotNil(stack)
+
+	stack = addMissingStackData(stack)
+
+	s.Contains(stack.Services, "app")
+	s.NotNil(stack.Services["app"].Description)
+	s.Equal("app", *stack.Services["app"].Description)
+	for _, svc := range stack.Services {
+		s.NoError(svc.Validate())
+	}
+}
+
+func (s *StackActionTestSuite) TestAddMissingStackData_FillsMissingServiceDescription() {
+	stack, err := parseStackObject(map[string]interface{}{
+		"services": map[string]interface{}{
+			"app": map[string]interface{}{
+				"image": "nginx",
+			},
+		},
+	})
+	s.NoError(err)
+	s.NotNil(stack)
+
+	stack = addMissingStackData(stack)
+
+	s.Contains(stack.Services, "app")
+	s.NotNil(stack.Services["app"].Description)
+	s.Equal("app", *stack.Services["app"].Description)
+	for _, svc := range stack.Services {
+		s.NoError(svc.Validate())
+	}
+}
+
+func (s *StackActionTestSuite) TestAddMissingStackData_EmptyServiceDescription() {
+	stack, err := parseStackObject(map[string]interface{}{
+		"services": map[string]interface{}{
+			"app": map[string]interface{}{
+				"image":       "nginx",
+				"description": "",
+			},
+		},
+	})
+	s.NoError(err)
+	s.NotNil(stack)
+
+	stack = addMissingStackData(stack)
+
+	s.Contains(stack.Services, "app")
+	s.NotNil(stack.Services["app"].Description)
+	s.Equal("app", *stack.Services["app"].Description)
+	for _, svc := range stack.Services {
+		s.NoError(svc.Validate())
+	}
+}
+
 func (s *StackActionTestSuite) TestLoadServicesToRecreate_EmptyList() {
 	os.Setenv(
 		"INPUT_STACK_YAML", `
@@ -295,6 +371,8 @@ volumes:
 	stack, err := loadStackData()
 	s.NoError(err)
 	s.NotNil(stack)
+
+	stack = addMissingStackData(stack)
 
 	servicesToRecreate := loadServicesToRecreate(stack.Services)
 	s.Len(servicesToRecreate, 1)
@@ -324,6 +402,8 @@ services:
 	stack, err := loadStackData()
 	s.NoError(err)
 	s.NotNil(stack)
+
+	stack = addMissingStackData(stack)
 
 	servicesToRecreate := loadServicesToRecreate(stack.Services)
 	s.Len(servicesToRecreate, 1)
@@ -359,6 +439,8 @@ services:
 	stack, err := loadStackData()
 	s.NoError(err)
 	s.NotNil(stack)
+
+	stack = addMissingStackData(stack)
 
 	servicesToRecreate := loadServicesToRecreate(stack.Services)
 	s.Len(servicesToRecreate, 1)

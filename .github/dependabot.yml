@@ -9,3 +9,7 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    groups:
+      mittwald-api:
+        patterns:
+          - "github.com/mittwald/api-client-go"

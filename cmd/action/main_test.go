@@ -449,6 +449,117 @@ services:
 	s.True(found)
 }
 
+// assertRejectsLineBreak sets a single environment variable and expects the given template to be
+// rejected because that variable's value would break out of its position in the YAML document.
+func (s *StackActionTestSuite) assertRejectsLineBreak(envName, envValue, stackYaml string) {
+	s.T().Helper()
+
+	os.Setenv(envName, envValue)
+	os.Setenv("INPUT_STACK_YAML", stackYaml)
+
+	result, err := loadYamlOptional("STACK")
+	s.Require().Error(err)
+	s.Nil(result)
+	s.Contains(err.Error(), envName)
+	s.Contains(err.Error(), "line break")
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_RejectsLineBreakInEnvValue() {
+	injection := "nginx\nvolumes:\n  evil:\n    name: pwned"
+
+	testCases := map[string]struct {
+		envValue  string
+		stackYaml string
+	}{
+		"value position": {
+			envValue:  injection,
+			stackYaml: "services:\n  app:\n    image: {{ .Env.INJECTED }}\n",
+		},
+		"comment position": {
+			envValue:  "line1\nimage: evil",
+			stackYaml: "services:\n  app:\n    image: nginx\n# db: {{ .Env.INJECTED }}\n",
+		},
+		"quoted value position": {
+			envValue:  "nginx\"\nvolumes:\n  evil:\n    name: \"pwned",
+			stackYaml: "services:\n  app:\n    image: \"{{ .Env.INJECTED }}\"\n",
+		},
+		"carriage return line feed": {
+			envValue:  "nginx\r\nvolumes:\r\n  evil:\r\n    name: pwned",
+			stackYaml: "services:\n  app:\n    image: {{ .Env.INJECTED }}\n",
+		},
+		"lone carriage return": {
+			envValue:  "nginx\rvolumes:\r  evil:\r    name: pwned",
+			stackYaml: "services:\n  app:\n    image: {{ .Env.INJECTED }}\n",
+		},
+		"trailing carriage return": {
+			envValue:  "nginx\r",
+			stackYaml: "services:\n  app:\n    image: {{ .Env.INJECTED }}\n",
+		},
+		"multi line secret in quoted value": {
+			envValue:  "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK7\n-----END RSA PRIVATE KEY-----",
+			stackYaml: "services:\n  app:\n    image: nginx\n    envs:\n      KEY: \"{{ .Env.INJECTED }}\"\n",
+		},
+		"index access": {
+			envValue:  injection,
+			stackYaml: "services:\n  app:\n    image: {{ index .Env \"INJECTED\" }}\n",
+		},
+	}
+
+	for name, testCase := range testCases {
+		s.Run(
+			name, func() {
+				os.Clearenv()
+				s.assertRejectsLineBreak("INJECTED", testCase.envValue, testCase.stackYaml)
+			},
+		)
+	}
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_IgnoresUnreferencedLineBreakEnvValue() {
+	os.Setenv("GITHUB_EVENT", "{\n  \"action\": \"opened\"\n}")
+	os.Setenv("INPUT_STACK_YAML", "services:\n  app:\n    image: nginx\n")
+
+	result, err := loadYamlOptional("STACK")
+	s.Require().NoError(err)
+
+	services, ok := result["services"].(map[string]interface{})
+	s.Require().True(ok)
+	s.Contains(services, "app")
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_SubstitutesWhileUnreferencedLineBreakEnvValueIsPresent() {
+	os.Setenv("GITHUB_EVENT", "{\n  \"action\": \"opened\"\n}")
+	os.Setenv("IMAGE", "nginx:1.27")
+	os.Setenv("INPUT_STACK_YAML", "services:\n  app:\n    image: {{ .Env.IMAGE }}\n")
+
+	result, err := loadYamlOptional("STACK")
+	s.Require().NoError(err)
+
+	services, ok := result["services"].(map[string]interface{})
+	s.Require().True(ok)
+	app, ok := services["app"].(map[string]interface{})
+	s.Require().True(ok)
+	s.Equal("nginx:1.27", app["image"])
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_AllowsLineBreakEnvValueInUntakenBranch() {
+	os.Setenv("MODE", "off")
+	os.Setenv("PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK7\n-----END RSA PRIVATE KEY-----")
+	os.Setenv(
+		"INPUT_STACK_YAML",
+		"services:\n  app:\n    image: {{ if eq .Env.MODE \"on\" }}{{ .Env.PRIVATE_KEY }}{{ else }}nginx{{ end }}\n",
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.Require().NoError(err)
+
+	services, ok := result["services"].(map[string]interface{})
+	s.Require().True(ok)
+	app, ok := services["app"].(map[string]interface{})
+	s.Require().True(ok)
+	s.Equal("nginx", app["image"])
+}
+
 func TestStackActionTestSuite(t *testing.T) {
 	suite.Run(t, new(StackActionTestSuite))
 }

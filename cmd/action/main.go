@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"text/template"
 
@@ -197,6 +198,11 @@ func loadYamlOptional(name string) (map[string]interface{}, error) {
 		return nil, nil
 	}
 
+	// Drop YAML comments before templating; text/template has no notion of YAML, so template
+	// expressions inside comments would otherwise be evaluated and could fail the whole action
+	// (see https://github.com/mittwald/deploy-container-action/issues/151)
+	rawInput = stripYamlComments(rawInput)
+
 	// Parse as Go template to allow environment variable substitution (e.g., {{ .Env.MY_VAR }})
 	configTemplate, createTplErr := template.New("").Option("missingkey=error").Parse(string(rawInput))
 	if createTplErr != nil {
@@ -216,6 +222,104 @@ func loadYamlOptional(name string) (map[string]interface{}, error) {
 	}
 
 	return parsed, nil
+}
+
+// blockScalarIndicator matches a YAML block scalar header token such as "|", ">", "|-", ">+" or "|2".
+var blockScalarIndicator = regexp.MustCompile(`^[|>][0-9]*[+-]?$|^[|>][+-]?[0-9]*$`)
+
+// notInsideBlockScalar is the sentinel used by stripYamlComments to signal that the scanner is
+// currently not inside a block scalar.
+const notInsideBlockScalar = -1
+
+// stripYamlComments removes YAML comments from the raw input while preserving the number of lines,
+// so that error messages from the template engine and the YAML parser keep pointing at the correct
+// line. Comments carry no meaning in YAML, but they are invisible to text/template: without this
+// step a commented-out "{{ .Env.SOMETHING }}" would still be evaluated and — because the template is
+// rendered with "missingkey=error" — could abort the deployment
+// (see https://github.com/mittwald/deploy-container-action/issues/151).
+//
+// A "#" only starts a comment when it appears at the start of a line or after whitespace, and never
+// inside a quoted scalar or inside a block scalar ("|" / ">"), where it is literal content — think of
+// a shebang in an embedded shell script. The scanner below tracks exactly those cases.
+//
+//nolint:cyclop,gocyclo,gocognit // a YAML-aware scanner is inherently branchy; the cases are covered by tests
+func stripYamlComments(rawInput []byte) []byte {
+	lines := strings.Split(string(rawInput), "\n")
+	stripped := make([]string, len(lines))
+
+	insideSingleQuotes, insideDoubleQuotes := false, false
+	blockScalarParentIndent := notInsideBlockScalar
+
+	for lineNumber, line := range lines {
+		// Content of a block scalar is passed through verbatim. It ends at the first non-blank
+		// line that is not indented deeper than the line introducing the block scalar.
+		if blockScalarParentIndent != notInsideBlockScalar {
+			if strings.TrimSpace(line) == "" || indentOf(line) > blockScalarParentIndent {
+				stripped[lineNumber] = line
+				continue
+			}
+
+			blockScalarParentIndent = notInsideBlockScalar
+		}
+
+		commentStart := len(line)
+
+		for i := 0; i < len(line); i++ {
+			switch char := line[i]; {
+			case insideDoubleQuotes:
+				if char == '\\' {
+					i++ // skip the escaped character
+				} else if char == '"' {
+					insideDoubleQuotes = false
+				}
+			case insideSingleQuotes:
+				if char == '\'' {
+					if i+1 < len(line) && line[i+1] == '\'' {
+						i++ // "''" is an escaped single quote
+					} else {
+						insideSingleQuotes = false
+					}
+				}
+			case char == '"':
+				insideDoubleQuotes = true
+			case char == '\'':
+				insideSingleQuotes = true
+			case char == '#':
+				if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
+					commentStart = i
+					i = len(line) // rest of the line is a comment
+				}
+			}
+		}
+
+		stripped[lineNumber] = line[:commentStart]
+
+		// A trailing "|" or ">" (after the comment has been cut off) opens a block scalar,
+		// whose content must not be touched by the following iterations.
+		if !insideSingleQuotes && !insideDoubleQuotes {
+			if fields := strings.Fields(stripped[lineNumber]); len(fields) > 0 &&
+				blockScalarIndicator.MatchString(fields[len(fields)-1]) {
+				blockScalarParentIndent = indentOf(line)
+			}
+		}
+	}
+
+	return []byte(strings.Join(stripped, "\n"))
+}
+
+// indentOf returns the number of leading spaces or tabs of a line, or notInsideBlockScalar for a
+// line that contains nothing but whitespace.
+func indentOf(line string) int {
+	indent := 0
+	for indent < len(line) && (line[indent] == ' ' || line[indent] == '\t') {
+		indent++
+	}
+
+	if indent == len(line) {
+		return notInsideBlockScalar
+	}
+
+	return indent
 }
 
 // loadYamlRequired is like loadYamlOptional, but throws an error if no input is found.

@@ -173,6 +173,20 @@ env:
   MONGODB_PASSWORD: ${{ secrets.DB_PASSWORD }}
 ```
 
+> [!NOTE]
+> YAML comments are stripped **before** the template is rendered, so template expressions inside a
+> comment are never evaluated. You can safely comment out a line that references an environment
+> variable without having to define that variable:
+>
+> ```yaml
+> envs:
+>   # MONGODB_PASSWORD: {{ .Env.MONGODB_PASSWORD }}   # not evaluated
+>   MONGODB_USER: {{ .Env.MONGODB_USER }}
+> ```
+>
+> A `#` inside a quoted value (`"a # b"`) or inside a block scalar (`|`, `>`) is kept as-is, so
+> shebangs and shell comments in embedded scripts remain intact.
+
 ## 🧪 Full Example with Secret Templating
 
 ```yaml

@@ -173,6 +173,10 @@ env:
   MONGODB_PASSWORD: ${{ secrets.DB_PASSWORD }}
 ```
 
+> [!IMPORTANT]
+> Values referenced through `{{ .Env.NAME }}` must be single-line. A value containing a line break
+> would corrupt the resulting YAML document, so the action rejects it with an error naming the variable.
+
 ## 🧪 Full Example with Secret Templating
 
 ```yaml

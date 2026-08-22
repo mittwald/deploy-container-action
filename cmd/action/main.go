@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -237,31 +239,89 @@ func mustEnv(key string) string {
 	return val
 }
 
+// lineBreakCharacters are rejected in substituted values because YAML treats each of them as a
+// line break, which would let a value escape its position in the document. See issue #153.
+const lineBreakCharacters = "\n\r"
+
+const sentinelNonceBytes = 8
+
 // renderConfigTemplate renders a Go text/template using environment variables as input.
 // Template variables can be accessed using {{ .Env.VARNAME }} syntax.
 //
 //nolint:mnd // suppress magic number linter complaining about env-separator
 func renderConfigTemplate(configTemplate *template.Template) (*bytes.Buffer, error) {
-	type templateData struct {
-		Env map[string]string
-	}
-
-	data := templateData{
-		Env: make(map[string]string),
-	}
-
-	// Collect all environment variables as key-value pairs
+	environment := make(map[string]string)
 	for _, env := range os.Environ() {
 		e := strings.SplitN(env, "=", 2)
 		if len(e) > 1 {
-			data.Env[e[0]] = e[1]
+			environment[e[0]] = e[1]
 		}
 	}
 
-	// Render the template into a buffer
+	probeEnvironment, sentinelsByToken, buildProbeErr := buildLineBreakProbe(environment)
+	if buildProbeErr != nil {
+		return nil, buildProbeErr
+	}
+
+	// Rendering with the probe first reveals which values actually reach the output. Multi-line
+	// variables are common on GitHub runners, so merely having one in the environment must not fail.
+	probeRender, probeRenderErr := executeConfigTemplate(configTemplate, probeEnvironment)
+	if probeRenderErr != nil {
+		return nil, probeRenderErr
+	}
+
+	for token, name := range sentinelsByToken {
+		if bytes.Contains(probeRender.Bytes(), []byte(token)) {
+			return nil, errors.Errorf(
+				"environment variable %q contains a line break and cannot be used in the configuration "+
+					"template; a line break would corrupt the resulting YAML document", name,
+			)
+		}
+	}
+
+	if len(sentinelsByToken) == 0 {
+		return probeRender, nil
+	}
+
+	return executeConfigTemplate(configTemplate, environment)
+}
+
+// buildLineBreakProbe copies the environment, replacing every value that contains a line break with
+// a unique token, and returns the copy along with a lookup from token to variable name.
+func buildLineBreakProbe(environment map[string]string) (map[string]string, map[string]string, error) {
+	nonce := make([]byte, sentinelNonceBytes)
+	if _, readRandomErr := rand.Read(nonce); readRandomErr != nil {
+		return nil, nil, errors.Wrap(readRandomErr, "failure while generating template probe nonce")
+	}
+
+	probeEnvironment := make(map[string]string, len(environment))
+	sentinelsByToken := make(map[string]string)
+
+	for name, value := range environment {
+		if !strings.ContainsAny(value, lineBreakCharacters) {
+			probeEnvironment[name] = value
+			continue
+		}
+
+		// The nonce makes the token impossible to forge through configuration input, and the
+		// encoded name keeps it free of characters that template functions such as html would escape.
+		token := "mittwaldLineBreakSentinel" + hex.EncodeToString(nonce) + hex.EncodeToString([]byte(name))
+		probeEnvironment[name] = token
+		sentinelsByToken[token] = name
+	}
+
+	return probeEnvironment, sentinelsByToken, nil
+}
+
+func executeConfigTemplate(configTemplate *template.Template, environment map[string]string) (*bytes.Buffer, error) {
+	data := struct {
+		Env map[string]string
+	}{
+		Env: environment,
+	}
+
 	renderedCfg := new(bytes.Buffer)
-	templateErr := configTemplate.Execute(renderedCfg, &data)
-	if templateErr != nil {
+	if templateErr := configTemplate.Execute(renderedCfg, &data); templateErr != nil {
 		return nil, errors.Wrap(templateErr, "failure while rendering template")
 	}
 

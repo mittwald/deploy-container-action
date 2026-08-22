@@ -450,7 +450,6 @@ services:
 	s.True(found)
 }
 
-// serviceField is a small helper to dig a single field out of the parsed services map.
 func (s *StackActionTestSuite) serviceField(parsed map[string]interface{}, service, field string) interface{} {
 	services, ok := parsed["services"].(map[string]interface{})
 	s.Require().True(ok, "expected a services map")
@@ -461,8 +460,7 @@ func (s *StackActionTestSuite) serviceField(parsed map[string]interface{}, servi
 	return svc[field]
 }
 
-// Regression tests for https://github.com/mittwald/deploy-container-action/issues/151:
-// template expressions inside YAML comments must never be evaluated.
+// Regression tests for https://github.com/mittwald/deploy-container-action/issues/151.
 
 func (s *StackActionTestSuite) TestLoadYamlOptional_IgnoresTemplateInFullLineComment() {
 	os.Setenv(

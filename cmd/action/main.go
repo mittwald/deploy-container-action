@@ -198,9 +198,8 @@ func loadYamlOptional(name string) (map[string]interface{}, error) {
 		return nil, nil
 	}
 
-	// Drop YAML comments before templating; text/template has no notion of YAML, so template
-	// expressions inside comments would otherwise be evaluated and could fail the whole action
-	// (see https://github.com/mittwald/deploy-container-action/issues/151)
+	// Comments are invisible to text/template, so a commented-out "{{ .Env.X }}" would still be
+	// evaluated: https://github.com/mittwald/deploy-container-action/issues/151
 	rawInput = stripYamlComments(rawInput)
 
 	// Parse as Go template to allow environment variable substitution (e.g., {{ .Env.MY_VAR }})
@@ -227,20 +226,12 @@ func loadYamlOptional(name string) (map[string]interface{}, error) {
 // blockScalarIndicator matches a YAML block scalar header token such as "|", ">", "|-", ">+" or "|2".
 var blockScalarIndicator = regexp.MustCompile(`^[|>][0-9]*[+-]?$|^[|>][+-]?[0-9]*$`)
 
-// notInsideBlockScalar is the sentinel used by stripYamlComments to signal that the scanner is
-// currently not inside a block scalar.
 const notInsideBlockScalar = -1
 
-// stripYamlComments removes YAML comments from the raw input while preserving the number of lines,
-// so that error messages from the template engine and the YAML parser keep pointing at the correct
-// line. Comments carry no meaning in YAML, but they are invisible to text/template: without this
-// step a commented-out "{{ .Env.SOMETHING }}" would still be evaluated and — because the template is
-// rendered with "missingkey=error" — could abort the deployment
-// (see https://github.com/mittwald/deploy-container-action/issues/151).
-//
-// A "#" only starts a comment when it appears at the start of a line or after whitespace, and never
-// inside a quoted scalar or inside a block scalar ("|" / ">"), where it is literal content — think of
-// a shebang in an embedded shell script. The scanner below tracks exactly those cases.
+// stripYamlComments strips YAML comments before the input is rendered as a Go template, keeping the
+// line count intact so error positions stay accurate. It honors the YAML rules that make a "#"
+// literal content: quoted scalars, a "#" not preceded by whitespace, and block scalars ("|" / ">"),
+// which may contain a shebang or shell comments.
 //
 //nolint:cyclop,gocyclo,gocognit // a YAML-aware scanner is inherently branchy; the cases are covered by tests
 func stripYamlComments(rawInput []byte) []byte {
@@ -251,8 +242,7 @@ func stripYamlComments(rawInput []byte) []byte {
 	blockScalarParentIndent := notInsideBlockScalar
 
 	for lineNumber, line := range lines {
-		// Content of a block scalar is passed through verbatim. It ends at the first non-blank
-		// line that is not indented deeper than the line introducing the block scalar.
+		// A block scalar ends at the first non-blank line that is not indented deeper than its header.
 		if blockScalarParentIndent != notInsideBlockScalar {
 			if strings.TrimSpace(line) == "" || indentOf(line) > blockScalarParentIndent {
 				stripped[lineNumber] = line
@@ -294,8 +284,7 @@ func stripYamlComments(rawInput []byte) []byte {
 
 		stripped[lineNumber] = line[:commentStart]
 
-		// A trailing "|" or ">" (after the comment has been cut off) opens a block scalar,
-		// whose content must not be touched by the following iterations.
+		// A trailing "|" or ">" opens a block scalar whose content must be passed through verbatim.
 		if !insideSingleQuotes && !insideDoubleQuotes {
 			if fields := strings.Fields(stripped[lineNumber]); len(fields) > 0 &&
 				blockScalarIndicator.MatchString(fields[len(fields)-1]) {
@@ -307,8 +296,7 @@ func stripYamlComments(rawInput []byte) []byte {
 	return []byte(strings.Join(stripped, "\n"))
 }
 
-// indentOf returns the number of leading spaces or tabs of a line, or notInsideBlockScalar for a
-// line that contains nothing but whitespace.
+// indentOf returns the number of leading spaces or tabs, or notInsideBlockScalar for a blank line.
 func indentOf(line string) int {
 	indent := 0
 	for indent < len(line) && (line[indent] == ' ' || line[indent] == '\t') {

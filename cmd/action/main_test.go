@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"text/template"
 
@@ -447,6 +448,222 @@ services:
 
 	_, found := servicesToRecreate["app"]
 	s.True(found)
+}
+
+func (s *StackActionTestSuite) serviceField(parsed map[string]interface{}, service, field string) interface{} {
+	services, ok := parsed["services"].(map[string]interface{})
+	s.Require().True(ok, "expected a services map")
+
+	svc, ok := services[service].(map[string]interface{})
+	s.Require().True(ok, "expected service %q", service)
+
+	return svc[field]
+}
+
+// Regression tests for https://github.com/mittwald/deploy-container-action/issues/151.
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_IgnoresTemplateInFullLineComment() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+# db_url: {{ .Env.UNSET_VAR }}
+services:
+  app:
+    image: nginx
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("nginx", s.serviceField(result, "app", "image"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_IgnoresTemplateInTrailingComment() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: nginx # was {{ .Env.UNSET_VAR }}
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("nginx", s.serviceField(result, "app", "image"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_IgnoresBrokenTemplateSyntaxInComment() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+# see {{
+services:
+  app:
+    image: nginx
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("nginx", s.serviceField(result, "app", "image"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_KeepsHashInDoubleQuotedScalar() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: nginx
+    description: "web # 1" # a real comment
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("web # 1", s.serviceField(result, "app", "description"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_KeepsHashInSingleQuotedScalar() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: nginx
+    description: 'web # 1'
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("web # 1", s.serviceField(result, "app", "description"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_KeepsHashWithoutPrecedingWhitespace() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: nginx#latest
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("nginx#latest", s.serviceField(result, "app", "image"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_KeepsShebangInsideBlockScalar() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: nginx
+    command: |
+      #!/bin/sh
+      echo "hello # world"
+    description: web # a real comment
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("#!/bin/sh\necho \"hello # world\"\n", s.serviceField(result, "app", "command"))
+	s.Equal("web", s.serviceField(result, "app", "description"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_StripsCommentOnBlockScalarHeader() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: nginx
+    command: | # {{ .Env.UNSET_VAR }}
+      #!/bin/sh
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("#!/bin/sh\n", s.serviceField(result, "app", "command"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_StillRendersTemplateOutsideComments() {
+	os.Setenv("MY_IMAGE", "nginx:1.27")
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+# image: {{ .Env.UNSET_VAR }}
+services:
+  app:
+    image: {{ .Env.MY_IMAGE }}
+`,
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.NoError(err)
+	s.Equal("nginx:1.27", s.serviceField(result, "app", "image"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_StillFailsOnMissingEnvOutsideComment() {
+	os.Setenv(
+		"INPUT_STACK_YAML", `
+services:
+  app:
+    image: {{ .Env.UNSET_VAR }}
+`,
+	)
+
+	_, err := loadYamlOptional("STACK")
+	s.Error(err)
+	s.Contains(err.Error(), `map has no entry for key "UNSET_VAR"`)
+}
+
+func (s *StackActionTestSuite) TestStripYamlComments() {
+	testCases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"full line comment", "# c {{ .Env.X }}\nkey: v\n", "\nkey: v\n"},
+		{"trailing comment", "key: v # {{ .Env.X }}\n", "key: v \n"},
+		{"indented comment", "a:\n  # c\n  b: 1\n", "a:\n  \n  b: 1\n"},
+		{"hash without whitespace", "key: nginx#latest\n", "key: nginx#latest\n"},
+		{"hash in double quotes", "key: \"a # b\" # real\n", "key: \"a # b\" \n"},
+		{"hash in single quotes", "key: 'a # b'\n", "key: 'a # b'\n"},
+		{"escaped single quote", "key: 'it''s # ok'\n", "key: 'it''s # ok'\n"},
+		{
+			"block scalar content",
+			"cmd: |\n  #!/bin/sh\n  echo hi # keep\nnext: 1 # drop\n",
+			"cmd: |\n  #!/bin/sh\n  echo hi # keep\nnext: 1 \n",
+		},
+		{"folded scalar with chomping", "cmd: >-\n  # keep\nnext: 1 # drop\n", "cmd: >-\n  # keep\nnext: 1 \n"},
+		{"comment on block scalar header", "cmd: | # drop\n  # keep\n", "cmd: | \n  # keep\n"},
+		{"blank line inside block scalar", "cmd: |\n  a\n\n  b\nnext: 1 # drop\n", "cmd: |\n  a\n\n  b\nnext: 1 \n"},
+		{
+			"nested block scalar",
+			"s:\n  app:\n    cmd: |\n      # keep\n    img: n # drop\n",
+			"s:\n  app:\n    cmd: |\n      # keep\n    img: n \n",
+		},
+		{
+			"multiline double quoted scalar",
+			"key: \"line one\n  # still string\"\nnext: 1 # drop\n",
+			"key: \"line one\n  # still string\"\nnext: 1 \n",
+		},
+		{"template is untouched", "envs:\n  P: {{ .Env.P }} # note\n", "envs:\n  P: {{ .Env.P }} \n"},
+	}
+
+	for _, testCase := range testCases {
+		s.Run(
+			testCase.name, func() {
+				s.Equal(testCase.expected, string(stripYamlComments([]byte(testCase.input))))
+			},
+		)
+	}
+}
+
+func (s *StackActionTestSuite) TestStripYamlComments_PreservesLineCount() {
+	input := "# one\nkey: v # two\n\n# three\n"
+	s.Equal(
+		strings.Count(input, "\n"),
+		strings.Count(string(stripYamlComments([]byte(input))), "\n"),
+	)
 }
 
 func TestStackActionTestSuite(t *testing.T) {

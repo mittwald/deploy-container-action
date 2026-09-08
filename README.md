@@ -155,6 +155,14 @@ If you want to restart all services, simply omit this input.
 > [!TIP]
 > Service names must match the ones defined under `services:` in your YAML.
 
+## 🔁 Retries on Transient API Failures
+
+The stack update is attempted up to 5 times (4 retries with exponential backoff: 2s, 4s, 8s, 16s)
+when no response is received (connection errors, timeouts) or the API answers with `429` or a `5xx`
+status. The request always carries the full desired state of the stack, so repeating it is safe even
+if the API had already processed an attempt that timed out on the way back.
+Other `4xx` responses (validation or authorization problems) fail immediately.
+
 ## 🧩 Environment Variable Parsing
 
 This action supports dynamic configuration using environment variables inside YAML files.

@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/mittwald/api-client-go/mittwaldv2/generated/schemas/containerv2"
 	"github.com/pkg/errors"
@@ -56,18 +60,27 @@ func main() {
 	}
 
 	// Call the API — this overrides the stack with the full state from YAML
-	updateStackResponse, updateStackHTTPResponse, updateStackErr := apiClient.Container().UpdateStack(ctx, req)
+	updateStackResponse, updateStackHTTPResponse, updateStackErr := updateStackWithRetry(
+		ctx, apiClient.Container(), req, updateStackInitialRetryDelay,
+	)
 	if updateStackErr != nil {
 		slog.With(slog.Any("error", updateStackErr)).Error("❌ failure while updating stack")
 
-		// If available, dump the raw HTTP body for diagnostics
-		plainHTTPResponse, plainTTPResponseErr := io.ReadAll(updateStackHTTPResponse.Body)
-		if plainTTPResponseErr == nil {
-			slog.With(slog.Any("response", string(plainHTTPResponse))).Error("🔎 http-response")
+		// If available, dump the raw HTTP body for diagnostics. There is no response at all
+		// when the request failed on the transport level (e.g. a connection timeout).
+		if updateStackHTTPResponse != nil {
+			defer updateStackHTTPResponse.Body.Close()
+
+			plainHTTPResponse, plainHTTPResponseErr := io.ReadAll(updateStackHTTPResponse.Body)
+			if plainHTTPResponseErr == nil {
+				slog.With(slog.Any("response", string(plainHTTPResponse))).Error("🔎 http-response")
+			}
 		}
 
 		panic(updateStackErr)
 	}
+
+	defer updateStackHTTPResponse.Body.Close()
 
 	slog.Info("✅ Stack updated successfully")
 
@@ -107,6 +120,94 @@ func main() {
 
 		slog.With("service", svc.ServiceName).Info("✅ Service recreated successfully")
 	}
+}
+
+// stackUpdater is the part of the container API client needed to declare a stack.
+type stackUpdater interface {
+	UpdateStack(
+		ctx context.Context,
+		req containerclientv2.UpdateStackRequest,
+		reqEditors ...func(req *http.Request) error,
+	) (*containerv2.StackResponse, *http.Response, error)
+}
+
+const (
+	// updateStackMaxAttempts bounds the retries of a failing stack update; with the initial
+	// delay doubling per attempt this covers roughly half a minute of API unavailability.
+	updateStackMaxAttempts       = 5
+	updateStackInitialRetryDelay = 2 * time.Second
+	// httpStatusCodeLimit is the first value above the valid HTTP status code range (100-599).
+	httpStatusCodeLimit = 600
+)
+
+// updateStackWithRetry declares the stack and retries transient failures with exponential
+// backoff. The request carries the full desired state of the stack, so repeating it is safe.
+func updateStackWithRetry(
+	ctx context.Context,
+	client stackUpdater,
+	req containerclientv2.UpdateStackRequest,
+	initialDelay time.Duration,
+) (*containerv2.StackResponse, *http.Response, error) {
+	delay := initialDelay
+
+	var lastErr error
+
+	for attempt := 1; ; attempt++ {
+		// Checked at the top of every iteration: the select below may pick the timer even when
+		// the context is already done, and with a zero delay both cases are ready at once.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if lastErr == nil {
+				return nil, nil, errors.Wrap(ctxErr, "stack update aborted")
+			}
+
+			// Both errors stay inspectable via errors.Is: the cancellation and the failure that
+			// led to the retry.
+			return nil, nil, fmt.Errorf("stack update aborted after transient failure: %w (%w)", ctxErr, lastErr)
+		}
+
+		response, httpResponse, updateErr := client.UpdateStack(ctx, req)
+		if updateErr == nil {
+			return response, httpResponse, nil
+		}
+
+		if attempt >= updateStackMaxAttempts || !isTransientFailure(httpResponse, updateErr) {
+			return nil, httpResponse, errors.Wrapf(updateErr, "stack update failed after %d attempt(s)", attempt)
+		}
+
+		lastErr = updateErr
+
+		slog.With(slog.Any("error", updateErr), "attempt", attempt, "retry_in", delay.String()).
+			Warn("⚠️ transient failure while updating stack, retrying")
+
+		// The body of a retried response is never read; release the connection.
+		if httpResponse != nil {
+			_ = httpResponse.Body.Close()
+		}
+
+		select {
+		case <-ctx.Done():
+			// handled by the check at the top of the next iteration
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+	}
+}
+
+// isTransientFailure reports whether a failed stack update is worth retrying: no response was
+// received (connection errors and timeouts surface as *url.Error without a response — the API
+// may or may not have processed the request, which is fine because the update is idempotent),
+// or the API answered with 429 / 5xx. Any other 4xx would fail again identically, and an error
+// without *url.Error and without response comes from building the request, not from sending it.
+func isTransientFailure(httpResponse *http.Response, err error) bool {
+	if httpResponse == nil {
+		var urlErr *url.Error
+
+		return errors.As(err, &urlErr)
+	}
+
+	return httpResponse.StatusCode == http.StatusTooManyRequests ||
+		(httpResponse.StatusCode >= http.StatusInternalServerError && httpResponse.StatusCode < httpStatusCodeLimit)
 }
 
 func addMissingStackData(stack *containerclientv2.UpdateStackRequestBody) *containerclientv2.UpdateStackRequestBody {

@@ -1,12 +1,19 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"text/template"
 
+	"github.com/mittwald/api-client-go/mittwaldv2/generated/clients/containerclientv2"
+	"github.com/mittwald/api-client-go/mittwaldv2/generated/schemas/containerv2"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -664,6 +671,148 @@ func (s *StackActionTestSuite) TestStripYamlComments_PreservesLineCount() {
 		strings.Count(input, "\n"),
 		strings.Count(string(stripYamlComments([]byte(input))), "\n"),
 	)
+}
+
+// updateStackResult is one scripted answer of the fake stack updater.
+type updateStackResult struct {
+	response     *containerv2.StackResponse
+	httpResponse *http.Response
+	err          error
+}
+
+// fakeStackUpdater replays scripted results in order and repeats the last one afterwards.
+type fakeStackUpdater struct {
+	results []updateStackResult
+	calls   int
+	onCall  func()
+}
+
+func (f *fakeStackUpdater) UpdateStack(
+	_ context.Context,
+	_ containerclientv2.UpdateStackRequest,
+	_ ...func(req *http.Request) error,
+) (*containerv2.StackResponse, *http.Response, error) {
+	index := f.calls
+	if index >= len(f.results) {
+		index = len(f.results) - 1
+	}
+	f.calls++
+
+	if f.onCall != nil {
+		f.onCall()
+	}
+
+	result := f.results[index]
+
+	return result.response, result.httpResponse, result.err
+}
+
+func httpResponseWithStatus(status int) *http.Response {
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(""))}
+}
+
+var (
+	errDialTimeout        = errors.New("dial tcp: i/o timeout")
+	errServiceUnavailable = errors.New("503")
+	errTooManyRequests    = errors.New("429")
+	errBadRequest         = errors.New("400")
+	errBadGateway         = errors.New("502")
+	errAboveHTTPRange     = errors.New("600")
+	errBuildRequest       = errors.New("failed to marshal request body")
+)
+
+func transportError() error {
+	return &url.Error{Op: "Patch", URL: "https://api.mittwald.de/v2/stacks/x", Err: errDialTimeout}
+}
+
+func (s *StackActionTestSuite) TestUpdateStackWithRetry_SucceedsAfterTransportErrors() {
+	success := &containerv2.StackResponse{}
+	fake := &fakeStackUpdater{results: []updateStackResult{
+		{err: transportError()},
+		{err: transportError()},
+		{response: success, httpResponse: httpResponseWithStatus(http.StatusOK)},
+	}}
+
+	response, _, err := updateStackWithRetry(context.Background(), fake, containerclientv2.UpdateStackRequest{}, 0)
+
+	s.Require().NoError(err)
+	s.Same(success, response)
+	s.Equal(3, fake.calls)
+}
+
+func (s *StackActionTestSuite) TestUpdateStackWithRetry_RetriesServerErrors() {
+	fake := &fakeStackUpdater{results: []updateStackResult{
+		{httpResponse: httpResponseWithStatus(http.StatusServiceUnavailable), err: errServiceUnavailable},
+		{httpResponse: httpResponseWithStatus(http.StatusTooManyRequests), err: errTooManyRequests},
+		{response: &containerv2.StackResponse{}, httpResponse: httpResponseWithStatus(http.StatusOK)},
+	}}
+
+	_, _, err := updateStackWithRetry(context.Background(), fake, containerclientv2.UpdateStackRequest{}, 0)
+
+	s.Require().NoError(err)
+	s.Equal(3, fake.calls)
+}
+
+func (s *StackActionTestSuite) TestUpdateStackWithRetry_DoesNotRetryClientErrors() {
+	fake := &fakeStackUpdater{results: []updateStackResult{
+		{httpResponse: httpResponseWithStatus(http.StatusBadRequest), err: errBadRequest},
+	}}
+
+	_, httpResponse, err := updateStackWithRetry(context.Background(), fake, containerclientv2.UpdateStackRequest{}, 0)
+
+	s.Require().ErrorIs(err, errBadRequest)
+	s.Equal(http.StatusBadRequest, httpResponse.StatusCode) // response is kept for diagnostics
+	s.Equal(1, fake.calls)
+}
+
+func (s *StackActionTestSuite) TestUpdateStackWithRetry_DoesNotRetryRequestBuildErrors() {
+	fake := &fakeStackUpdater{results: []updateStackResult{{err: errBuildRequest}}}
+
+	_, httpResponse, err := updateStackWithRetry(context.Background(), fake, containerclientv2.UpdateStackRequest{}, 0)
+
+	s.Require().ErrorIs(err, errBuildRequest)
+	s.Nil(httpResponse)
+	s.Equal(1, fake.calls)
+}
+
+func (s *StackActionTestSuite) TestUpdateStackWithRetry_GivesUpAfterMaxAttempts() {
+	fake := &fakeStackUpdater{results: []updateStackResult{{err: transportError()}}}
+
+	_, httpResponse, err := updateStackWithRetry(context.Background(), fake, containerclientv2.UpdateStackRequest{}, 0)
+
+	s.Require().Error(err)
+	s.Nil(httpResponse) // nothing to dump — main must not dereference it
+	s.Equal(updateStackMaxAttempts, fake.calls)
+}
+
+func (s *StackActionTestSuite) TestUpdateStackWithRetry_StopsWhenContextIsCancelled() {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fake := &fakeStackUpdater{results: []updateStackResult{{err: transportError()}}}
+
+	_, httpResponse, err := updateStackWithRetry(ctx, fake, containerclientv2.UpdateStackRequest{}, 0)
+
+	s.Require().ErrorIs(err, context.Canceled)
+	s.Nil(httpResponse)
+	s.Equal(0, fake.calls)
+}
+
+func (s *StackActionTestSuite) TestUpdateStackWithRetry_ReportsCancellationDuringBackoff() {
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeStackUpdater{results: []updateStackResult{{err: transportError()}}}
+	fake.onCall = cancel // cancelled while the first attempt is in flight
+
+	_, httpResponse, err := updateStackWithRetry(ctx, fake, containerclientv2.UpdateStackRequest{}, 0)
+
+	s.Require().ErrorIs(err, context.Canceled)
+	s.Contains(err.Error(), "i/o timeout") // the transient failure is kept as cause
+	s.Nil(httpResponse)                    // its body was closed, nothing usable to return
+	s.Equal(1, fake.calls)
+}
+
+func (s *StackActionTestSuite) TestIsTransientFailure_IgnoresStatusCodesAboveTheHTTPRange() {
+	s.True(isTransientFailure(httpResponseWithStatus(http.StatusBadGateway), errBadGateway))
+	s.False(isTransientFailure(httpResponseWithStatus(600), errAboveHTTPRange))
 }
 
 func TestStackActionTestSuite(t *testing.T) {

@@ -8,7 +8,7 @@ require (
 )
 
 require (
-	github.com/mittwald/api-client-go v0.2.237
+	github.com/mittwald/api-client-go v0.2.240
 	github.com/stretchr/testify v1.12.1
 )
 

@@ -262,6 +262,25 @@ Several full example files are provided under the `examples/` directory in this 
 
 This action is written in Go and uses the official [mittwald/api-client-go](https://github.com/mittwald/api-client-go) SDK (v2). See `main.go` for details.
 
+### 📦 Releasing
+
+The action runs a prebuilt image from GHCR. `action.yaml` references that image by digest, so a
+workflow that pins this action to a commit SHA also pins the exact code that receives its API token.
+
+1. Merge the changes to `main`.
+2. Run the **Build Action Image** workflow (`.github/workflows/build-image.yml`) on `main`. It pushes
+   `ghcr.io/mittwald/deploy-container-action:sha-<commit>` with a signed build provenance attestation
+   and shows the `image:` line for `action.yaml` in its job summary.
+3. Commit that line to `action.yaml` through a pull request.
+4. Publish the GitHub release from a commit that contains the pin. The **Publish Action Image**
+   workflow (`.github/workflows/release.yml`) verifies the attestation, checks that `Dockerfile`,
+   `.dockerignore`, `Makefile`, `go.mod`, `go.sum` and `cmd/` have not changed since the image was
+   built, and then adds the `vX.Y.Z`, `vX.Y` and `vX` tags to the pinned digest. It fails if any of
+   these checks fails.
+
+Anyone can check where an image came from with
+`gh attestation verify oci://ghcr.io/mittwald/deploy-container-action@sha256:<digest> --repo mittwald/deploy-container-action`.
+
 ## 🤝 Contributing
 
 Feel free to open issues or PRs — improvements and use-cases are welcome!

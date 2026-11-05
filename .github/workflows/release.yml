@@ -1,41 +1,92 @@
-name: Build and Publish Action Image
+name: Publish Action Image
 
+# The image is not built here. build-image.yml builds it, and action.yaml pins its digest, so that a
+# consumer who pins this action to a commit also pins the code that receives their API token. A
+# release only adds its version tags to the pinned digest, after checking that the digest was built
+# by build-image.yml from main and that the build inputs have not changed since.
 on:
   release:
     types: [published]
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # add the release tags to the pinned image
+      attestations: read # verify the pinned image's provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the image digest pinned in action.yaml
+        id: pin
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          digest="$(sed -nE "s#^[[:space:]]*image:[[:space:]]*'docker://${IMAGE}@(sha256:[0-9a-f]{64})'[[:space:]]*\$#\1#p" action.yaml)"
+          if [ -z "$digest" ]; then
+            echo "::error file=action.yaml::action.yaml must pin 'docker://${IMAGE}@sha256:<digest>'. Run the 'Build Action Image' workflow on main and commit the digest it reports before publishing a release."
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify that the pinned image was built from the released code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.pin.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          built_from="$(gh attestation verify "oci://${IMAGE}@${DIGEST}" \
+            --repo "$REPOSITORY" \
+            --signer-workflow "${REPOSITORY}/.github/workflows/build-image.yml" \
+            --source-ref refs/heads/main \
+            --format json \
+            --jq '.[0].verificationResult.signature.certificate.sourceRepositoryDigest')"
+          if ! git merge-base --is-ancestor "$built_from" HEAD; then
+            echo "::error::The pinned image was built from ${built_from}, which is not part of this release."
+            exit 1
+          fi
+          build_inputs=(Dockerfile .dockerignore Makefile go.mod go.sum cmd)
+          if ! git diff --quiet "$built_from" HEAD -- "${build_inputs[@]}"; then
+            git diff --stat "$built_from" HEAD -- "${build_inputs[@]}"
+            echo "::error::The build inputs changed after ${built_from}. Run the 'Build Action Image' workflow again and pin the new digest."
+            exit 1
+          fi
+
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern=v{{major}}
             type=semver,pattern=v{{major}}.{{minor}}
             type=semver,pattern=v{{version}}
-            type=sha
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      # The v1 tag is still moved so that older releases, whose action.yaml references
+      # ghcr.io/mittwald/deploy-container-action:v1, keep receiving fixes.
+      - name: Tag the pinned image with the release version
+        env:
+          SOURCE: ghcr.io/${{ github.repository }}@${{ steps.pin.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          args=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              args+=(--tag "$tag")
+            fi
+          done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "$SOURCE"

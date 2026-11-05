@@ -9,7 +9,11 @@ jobs:
     permissions:
       contents: write # merge the pull request
       pull-requests: write # approve the pull request and enable auto-merge
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    # Only for events Dependabot itself caused on its own pull requests. fetch-metadata verifies just
+    # the first commit, so the actor check keeps a later push by someone else to a Dependabot branch
+    # from being approved and merged automatically. Fork pull requests get a read-only token here, so
+    # the actor cannot be used to gain write access.
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]' # zizmor: ignore[bot-conditions]
     steps:
       - name: Dependabot metadata
         id: metadata

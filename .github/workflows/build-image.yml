@@ -52,6 +52,9 @@ jobs:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+          # The optional organisation storage record would need the additional artifact-metadata: write
+          # permission; without it the action only logs a warning. release.yml does not use it.
+          create-storage-record: false
 
       - name: Report the digest to pin in action.yaml
         env:

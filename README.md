@@ -197,6 +197,8 @@ env:
 >   makes the document invalid;
 > - inside `"{{ .Env.NAME }}"`, a `"` in the value ends the string early and a `\` starts an escape
 >   sequence;
+> - inside a flow collection (`{ ... }` or `[ ... ]`), a `,` ends the value, so the rest of it can add
+>   keys or items, for example an `entrypoint` in `app: { image: {{ .Env.NAME }} }`;
 > - a line break would let the value add keys or whole services to the stack. Such values (for example
 >   commit messages, pull request or release texts, multi-line secrets) are therefore rejected with an
 >   error naming the variable unless they are inserted with `quote`.

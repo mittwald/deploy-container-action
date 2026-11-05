@@ -14,7 +14,7 @@ It supports flexible configuration using YAML files or inline YAML strings and i
   - single `stack.yaml` (services + volumes)
   - separate `services.yaml` and `volumes.yaml`
   - inline YAML via action `with:` parameters
-- Supports environment variable templating in YAML (`{{ .Env.MY_VAR }}`)
+- Supports environment variable templating in YAML (`{{ quote .Env.MY_VAR }}`)
 
 > [!IMPORTANT]
 > **Note about the mStudio API**
@@ -68,10 +68,10 @@ services:
     ports:
       - "3306/tcp"
     envs:
-      MYSQL_ROOT_PASSWORD: {{ .Env.MYSQL_ROOT_PASSWORD }}
-      MYSQL_DATABASE: {{ .Env.MYSQL_DATABASE }}
-      MYSQL_USER: {{ .Env.MYSQL_USER }}
-      MYSQL_PASSWORD: {{ .Env.MYSQL_PASSWORD }}
+      MYSQL_ROOT_PASSWORD: {{ quote .Env.MYSQL_ROOT_PASSWORD }}
+      MYSQL_DATABASE: {{ quote .Env.MYSQL_DATABASE }}
+      MYSQL_USER: {{ quote .Env.MYSQL_USER }}
+      MYSQL_PASSWORD: {{ quote .Env.MYSQL_PASSWORD }}
     volumes:
       - "mysql:/var/lib/mysql"
 
@@ -81,7 +81,9 @@ volumes:
 ```
 
 > [!TIP]
-> The placeholders like `{{ .Env.MYSQL_ROOT_PASSWORD }}` will be replaced using the environment variables at runtime.
+> The placeholders like `{{ quote .Env.MYSQL_ROOT_PASSWORD }}` will be replaced using the environment variables at runtime.
+> `quote` inserts the value as a quoted YAML string, so it arrives exactly as given; see
+> [Environment Variable Parsing](#-environment-variable-parsing).
 
 You must provide these variables in the workflow's `env` block if they are used in your stack file:
 
@@ -171,7 +173,7 @@ Example usage in YAML:
 
 ```yaml
 envs:
-  MONGODB_PASSWORD: {{ .Env.MONGODB_PASSWORD }}
+  MONGODB_PASSWORD: {{ quote .Env.MONGODB_PASSWORD }}
 ```
 
 To make this work, you must define the variables in your workflow under the `env:` section:
@@ -181,14 +183,42 @@ env:
   MONGODB_PASSWORD: ${{ secrets.DB_PASSWORD }}
 ```
 
+> [!IMPORTANT]
+> **Always insert values with `quote`.** `{{ quote .Env.NAME }}` renders the value as a double-quoted
+> YAML string with every special character escaped, so it is deployed exactly as given and cannot
+> change the structure of your stack. Write it without surrounding quotes (`KEY: {{ quote .Env.NAME }}`,
+> not `KEY: "{{ quote .Env.NAME }}"`); `{{ .Env.NAME | quote }}` works as well.
+>
+> A plain `{{ .Env.NAME }}` is pasted into the YAML document verbatim. That is only safe for values you
+> control that consist of simple characters. With other values, YAML reinterprets the text:
+>
+> - ` #` starts a comment, so a password like `abc #123` is silently deployed as `abc`;
+> - `: ` or a leading `[`, `{`, `*`, `&`, `!`, `'` or `"` changes the type or meaning of the value or
+>   makes the document invalid;
+> - inside `"{{ .Env.NAME }}"`, a `"` in the value ends the string early and a `\` starts an escape
+>   sequence;
+> - a line break would let the value add keys or whole services to the stack. Such values (for example
+>   commit messages, pull request or release texts, multi-line secrets) are therefore rejected with an
+>   error naming the variable unless they are inserted with `quote`.
+>
+> This matters most for values that someone other than you can influence, such as commit messages,
+> branch names, issue or pull request texts and `workflow_dispatch` inputs.
+
+> [!NOTE]
+> The template sees the environment of the action's container: variables from the workflow's `env:`
+> blocks plus those GitHub sets for every job (`GITHUB_*`, `RUNNER_*`, ...). The action's own API token
+> (`INPUT_API_TOKEN`) and the runner's internal credentials (`ACTIONS_RUNTIME_TOKEN`,
+> `ACTIONS_ID_TOKEN_REQUEST_TOKEN` and the related `ACTIONS_*_URL` variables) are not available to the
+> template.
+
 > [!NOTE]
 > YAML comments are stripped **before** the template is rendered, so you can comment out a line
 > referencing an environment variable without having to define that variable:
 >
 > ```yaml
 > envs:
->   # MONGODB_PASSWORD: {{ .Env.MONGODB_PASSWORD }}   # not evaluated
->   MONGODB_USER: {{ .Env.MONGODB_USER }}
+>   # MONGODB_PASSWORD: {{ quote .Env.MONGODB_PASSWORD }}   # not evaluated
+>   MONGODB_USER: {{ quote .Env.MONGODB_USER }}
 > ```
 >
 > A `#` inside a quoted value (`"a # b"`) or a block scalar (`|`, `>`) is kept, so shebangs and

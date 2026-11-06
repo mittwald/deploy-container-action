@@ -9,7 +9,28 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    # A new release is only picked up after it has been public for a while, so that a compromised
+    # or broken release can be noticed and yanked first. Security updates are not delayed.
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
     groups:
       mittwald-api:
         patterns:
           - "github.com/mittwald/api-client-go"
+
+  # Keeps the commit SHAs of the actions used in .github/workflows current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  # Keeps the digest-pinned base images in the Dockerfile current.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7

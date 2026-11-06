@@ -8,6 +8,10 @@ branding:
 
 runs:
   using: 'docker'
+  # The image must be pinned by digest, so that pinning this action to a commit also pins the code
+  # that receives the API token: run the "Build Action Image" workflow on main and replace this line
+  # with the one it reports (docker://ghcr.io/mittwald/deploy-container-action@sha256:...).
+  # release.yml refuses to publish a release until then. See "Releasing" in README.md.
   image: 'docker://ghcr.io/mittwald/deploy-container-action:v1'
 
 inputs:

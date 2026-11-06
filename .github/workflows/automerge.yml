@@ -1,18 +1,23 @@
 name: Dependabot auto-merge
 on: pull_request
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   dependabot:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    permissions:
+      contents: write # merge the pull request
+      pull-requests: write # approve the pull request and enable auto-merge
+    # Only for events Dependabot itself caused on its own pull requests. fetch-metadata verifies just
+    # the first commit, so the actor check keeps a later push by someone else to a Dependabot branch
+    # from being approved and merged automatically. Fork pull requests get a read-only token here, so
+    # the actor cannot be used to gain write access.
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]' # zizmor: ignore[bot-conditions]
     steps:
       - name: Dependabot metadata
         id: metadata
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2.5.0
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
       - name: Approve a PR
@@ -20,12 +25,17 @@ jobs:
         env:
           PR_URL: ${{github.event.pull_request.html_url}}
           GH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      # Only Go module updates are merged automatically. Updates of GitHub Actions and base images
+      # change the pipeline that publishes the action's image and therefore need a human review.
+      # Updates of the mittwald API client are merged up to minor versions; major versions need a review.
       - name: Enable auto-merge for Dependabot PRs
         if:
-          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.dependency-group == 'mittwald-api' ||
+          steps.metadata.outputs.package-ecosystem == 'go_modules' &&
+          (steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          (steps.metadata.outputs.dependency-group == 'mittwald-api' &&
+          steps.metadata.outputs.update-type == 'version-update:semver-minor') ||
           (steps.metadata.outputs.dependency-type == 'direct:development' &&
-          steps.metadata.outputs.update-type == 'version-update:semver-minor')
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'))
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{github.event.pull_request.html_url}}

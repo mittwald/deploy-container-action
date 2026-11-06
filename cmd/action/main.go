@@ -3,17 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"github.com/mittwald/api-client-go/mittwaldv2/generated/schemas/containerv2"
 	"github.com/pkg/errors"
@@ -303,16 +308,10 @@ func loadYamlOptional(name string) (map[string]interface{}, error) {
 	// evaluated: https://github.com/mittwald/deploy-container-action/issues/151
 	rawInput = stripYamlComments(rawInput)
 
-	// Parse as Go template to allow environment variable substitution (e.g., {{ .Env.MY_VAR }})
-	configTemplate, createTplErr := template.New("").Option("missingkey=error").Parse(string(rawInput))
-	if createTplErr != nil {
-		return nil, errors.Wrap(createTplErr, "failure while creating template from input")
-	}
-
-	// Render template using env vars
-	templatedInput, parseTemplateErr := renderConfigTemplate(configTemplate)
-	if parseTemplateErr != nil {
-		return nil, parseTemplateErr
+	// Render as Go template to allow environment variable substitution (e.g., {{ .Env.MY_VAR }})
+	templatedInput, renderTemplateErr := renderConfigTemplate(string(rawInput))
+	if renderTemplateErr != nil {
+		return nil, renderTemplateErr
 	}
 
 	// Parse templated YAML into map
@@ -430,25 +429,32 @@ func mustEnv(key string) string {
 	return val
 }
 
-// renderConfigTemplate renders a Go text/template using environment variables as input.
-// Template variables can be accessed using {{ .Env.VARNAME }} syntax.
+// renderConfigTemplate renders the configuration as a Go text/template using environment variables
+// as input. Template variables can be accessed using {{ .Env.VARNAME }} syntax, and
+// {{ quote .Env.VARNAME }} inserts a value as a YAML double-quoted string that keeps its exact content.
 //
-//nolint:mnd // suppress magic number linter complaining about env-separator
-func renderConfigTemplate(configTemplate *template.Template) (*bytes.Buffer, error) {
-	type templateData struct {
+// A value containing a line break would leave its position in the YAML document when substituted
+// as-is, so such values may only be used through quote; anything else is rejected. See issue #153.
+func renderConfigTemplate(rawTemplate string) (*bytes.Buffer, error) {
+	maskedEnvironment, mask, maskErr := maskLineBreakValues(templateEnvironment())
+	if maskErr != nil {
+		return nil, maskErr
+	}
+
+	configTemplate, createTplErr := template.New("").
+		Option("missingkey=error").
+		Funcs(template.FuncMap{
+			"quote": func(value string) string { return yamlQuote(mask.unmask(value)) },
+		}).
+		Parse(rawTemplate)
+	if createTplErr != nil {
+		return nil, errors.Wrap(createTplErr, "failure while creating template from input")
+	}
+
+	data := struct {
 		Env map[string]string
-	}
-
-	data := templateData{
-		Env: make(map[string]string),
-	}
-
-	// Collect all environment variables as key-value pairs
-	for _, env := range os.Environ() {
-		e := strings.SplitN(env, "=", 2)
-		if len(e) > 1 {
-			data.Env[e[0]] = e[1]
-		}
+	}{
+		Env: maskedEnvironment,
 	}
 
 	// Render the template into a buffer
@@ -458,7 +464,172 @@ func renderConfigTemplate(configTemplate *template.Template) (*bytes.Buffer, err
 		return nil, errors.Wrap(templateErr, "failure while rendering template")
 	}
 
+	if leakedNames := mask.namesIn(renderedCfg.Bytes()); len(leakedNames) > 0 {
+		return nil, errors.Errorf(
+			"environment variable(s) %s contain a line break and cannot be inserted as-is, because a line "+
+				"break would corrupt the resulting YAML document; use {{ quote .Env.NAME }} instead",
+			strings.Join(leakedNames, ", "),
+		)
+	}
+
 	return renderedCfg, nil
+}
+
+// hiddenTemplateEnv lists credentials that the runner places in the action's environment. Describing
+// a stack never needs them, and exposing them would let whoever writes the stack YAML copy them into a
+// container: the mStudio API token is usually valid for far more than this one stack.
+var hiddenTemplateEnv = map[string]struct{}{
+	"INPUT_API_TOKEN":                {},
+	"ACTIONS_RUNTIME_TOKEN":          {},
+	"ACTIONS_RUNTIME_URL":            {},
+	"ACTIONS_CACHE_URL":              {},
+	"ACTIONS_RESULTS_URL":            {},
+	"ACTIONS_ID_TOKEN_REQUEST_TOKEN": {},
+	"ACTIONS_ID_TOKEN_REQUEST_URL":   {},
+}
+
+// templateEnvironment returns the environment variables available to the configuration template.
+func templateEnvironment() map[string]string {
+	environment := make(map[string]string)
+
+	for _, env := range os.Environ() {
+		name, value, found := strings.Cut(env, "=")
+		if !found {
+			continue
+		}
+
+		if _, hidden := hiddenTemplateEnv[name]; hidden {
+			continue
+		}
+
+		environment[name] = value
+	}
+
+	return environment
+}
+
+// yamlLineBreaks are the characters YAML parsers (including gopkg.in/yaml.v3) treat as line breaks:
+// LF, CR, NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR.
+const yamlLineBreaks = "\n\r\u0085\u2028\u2029"
+
+const maskNonceBytes = 8
+
+// lineBreakMask stands in for every environment value that contains a line break. The template only
+// sees a token for such a value; quote swaps the real value back in before escaping it. A raw line
+// break can therefore only reach the rendered document through the template text itself, whatever
+// the template does with the value (print, printf, index, range, ...).
+type lineBreakMask struct {
+	namesByToken map[string]string
+	unmasker     *strings.Replacer
+}
+
+// maskLineBreakValues returns a copy of the environment in which every value containing a line break
+// is replaced by a unique token, together with the mask that maps the tokens back.
+func maskLineBreakValues(environment map[string]string) (map[string]string, *lineBreakMask, error) {
+	nonce := make([]byte, maskNonceBytes)
+
+	_, readRandomErr := rand.Read(nonce)
+	if readRandomErr != nil {
+		return nil, nil, errors.Wrap(readRandomErr, "failure while generating template mask nonce")
+	}
+
+	masked := make(map[string]string, len(environment))
+	namesByToken := make(map[string]string)
+
+	var replacements []string
+
+	for _, name := range slices.Sorted(maps.Keys(environment)) {
+		value := environment[name]
+		if !strings.ContainsAny(value, yamlLineBreaks) {
+			masked[name] = value
+			continue
+		}
+
+		// The random nonce keeps tokens unguessable for configuration input. Tokens have a fixed
+		// length, so none is a prefix of another, and consist of letters and digits only, so that
+		// escaping functions such as html or js leave them intact.
+		token := fmt.Sprintf("mittwaldLineBreak%x%08d", nonce, len(namesByToken))
+		masked[name] = token
+		namesByToken[token] = name
+		replacements = append(replacements, token, value)
+	}
+
+	mask := &lineBreakMask{
+		namesByToken: namesByToken,
+		unmasker:     strings.NewReplacer(replacements...),
+	}
+
+	return masked, mask, nil
+}
+
+// unmask replaces every token in value with the original value it stands for.
+func (m *lineBreakMask) unmask(value string) string {
+	return m.unmasker.Replace(value)
+}
+
+// namesIn returns the sorted names of the variables whose token occurs in rendered.
+func (m *lineBreakMask) namesIn(rendered []byte) []string {
+	var names []string
+
+	for token, name := range m.namesByToken {
+		if bytes.Contains(rendered, []byte(token)) {
+			names = append(names, strconv.Quote(name))
+		}
+	}
+
+	slices.Sort(names)
+
+	return names
+}
+
+// yamlQuote renders value as a YAML double-quoted scalar that parses back to exactly value: quotes,
+// backslashes, line breaks and every character YAML does not allow verbatim are escaped, so the
+// value cannot end the scalar, start a comment or add structure to the document. Invalid UTF-8 is
+// replaced by U+FFFD.
+func yamlQuote(value string) string {
+	var quoted strings.Builder
+
+	quoted.Grow(len(value) + len(`""`))
+	quoted.WriteByte('"')
+
+	for _, char := range value {
+		switch {
+		case char == '"' || char == '\\':
+			quoted.WriteByte('\\')
+			quoted.WriteRune(char)
+		case char == '\n':
+			quoted.WriteString(`\n`)
+		case char == '\r':
+			quoted.WriteString(`\r`)
+		case char == '\t':
+			quoted.WriteString(`\t`)
+		case isVerbatimYAMLChar(char):
+			quoted.WriteRune(char)
+		default:
+			// Every remaining character is below U+10000, so the four-digit escape suffices.
+			fmt.Fprintf(&quoted, `\u%04X`, char)
+		}
+	}
+
+	quoted.WriteByte('"')
+
+	return quoted.String()
+}
+
+// isVerbatimYAMLChar reports whether char may appear unescaped inside a YAML double-quoted scalar:
+// a printable character (YAML 1.2, section 5.1) that is neither a line break nor a byte order mark.
+func isVerbatimYAMLChar(char rune) bool {
+	switch {
+	case char == '\u2028', char == '\u2029', char == '\uFEFF':
+		return false
+	case char >= 0x20 && char <= 0x7E,
+		char >= 0xA0 && char <= 0xD7FF,
+		char >= 0xE000 && char <= 0xFFFD,
+		char >= 0x10000 && char <= unicode.MaxRune:
+		return true
+	default:
+		return false
+	}
 }
 
 // loadServicesToRecreate builds a set of services to be restarted after the stack update.

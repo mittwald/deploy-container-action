@@ -1,6 +1,6 @@
 module github.com/Hermsi1337/mittwald-container-action
 
-go 1.26.8
+go 1.26.10
 
 require (
 	github.com/pkg/errors v0.9.1
